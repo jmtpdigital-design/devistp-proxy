@@ -6,6 +6,23 @@ const app = express();
 app.use(cors());
 app.use(express.json({ limit: '20mb' }));
 
+// ── STOCKAGE MÉMOIRE (persiste tant que Render tourne) ──
+// Pour une vraie persistance, il faudrait une DB
+// Render gratuit redémarre parfois, donc on utilise un fichier JSON
+const fs = require('fs');
+const DB_FILE = '/tmp/devis_db.json';
+
+function loadDB() {
+  try {
+    if (fs.existsSync(DB_FILE)) return JSON.parse(fs.readFileSync(DB_FILE, 'utf8'));
+  } catch(e) {}
+  return { devis: [] };
+}
+
+function saveDB(db) {
+  try { fs.writeFileSync(DB_FILE, JSON.stringify(db)); } catch(e) {}
+}
+
 // ── PROXY ANTHROPIC ──
 app.post('/api/claude', async (req, res) => {
   try {
@@ -41,7 +58,6 @@ app.post('/api/inpainting', async (req, res) => {
 
     const { image, mask, prompt } = req.body;
 
-    // Soumettre le job à fal.ai FLUX Fill
     const submitResp = await fetch('https://queue.fal.run/fal-ai/flux-pro/v1/fill', {
       method: 'POST',
       headers: {
@@ -51,7 +67,7 @@ app.post('/api/inpainting', async (req, res) => {
       body: JSON.stringify({
         image_url: image,
         mask_url: mask,
-        prompt: prompt || 'compacted gravel driveway 0/20, flat clean professional surface, construction site finished, realistic',
+        prompt: prompt || 'compacted gravel driveway 0/20, flat clean professional surface, realistic photo',
         num_inference_steps: 28,
         guidance_scale: 60,
         output_format: 'jpeg'
@@ -60,14 +76,11 @@ app.post('/api/inpainting', async (req, res) => {
 
     const submitData = await submitResp.json();
     console.log('Fal submit:', JSON.stringify(submitData).substring(0, 200));
-
     if (submitData.detail) return res.status(400).json({ error: submitData.detail });
 
     const requestId = submitData.request_id;
-    if (!requestId) return res.status(500).json({ error: 'No request_id from fal', raw: submitData });
+    if (!requestId) return res.status(500).json({ error: 'No request_id', raw: submitData });
 
-    // Polling du résultat
-    let result = null;
     for (let i = 0; i < 30; i++) {
       await new Promise(r => setTimeout(r, 2000));
       const pollResp = await fetch(`https://queue.fal.run/fal-ai/flux-pro/v1/fill/requests/${requestId}`, {
@@ -75,27 +88,16 @@ app.post('/api/inpainting', async (req, res) => {
       });
       const pollData = await pollResp.json();
       console.log(`Poll ${i+1}:`, pollData.status);
-
       if (pollData.status === 'COMPLETED') {
-        result = pollData;
-        break;
+        const imageUrl = pollData.output?.images?.[0]?.url || pollData.output?.image?.url;
+        if (!imageUrl) return res.status(500).json({ error: 'No image in result' });
+        const imgResp = await fetch(imageUrl);
+        const buffer = await imgResp.buffer();
+        return res.json({ image: 'data:image/jpeg;base64,' + buffer.toString('base64') });
       }
-      if (pollData.status === 'FAILED') {
-        return res.status(500).json({ error: 'Fal job failed', raw: pollData });
-      }
+      if (pollData.status === 'FAILED') return res.status(500).json({ error: 'Fal job failed' });
     }
-
-    if (!result) return res.status(500).json({ error: 'Timeout waiting for result' });
-
-    // Récupérer l'image résultat
-    const imageUrl = result.output?.images?.[0]?.url || result.output?.image?.url;
-    if (!imageUrl) return res.status(500).json({ error: 'No image in result', raw: result });
-
-    // Télécharger et retourner en base64
-    const imgResp = await fetch(imageUrl);
-    const buffer = await imgResp.buffer();
-    const base64 = buffer.toString('base64');
-    res.json({ image: 'data:image/jpeg;base64,' + base64 });
+    res.status(500).json({ error: 'Timeout' });
 
   } catch(e) {
     console.error('Inpainting error:', e.message);
@@ -103,7 +105,54 @@ app.post('/api/inpainting', async (req, res) => {
   }
 });
 
-app.get('/', (req, res) => res.send('DevisTP Proxy OK — Claude + Flux Inpainting'));
+// ── SAUVEGARDE DEVIS ──
+app.post('/api/devis/save', (req, res) => {
+  try {
+    const db = loadDB();
+    const devis = req.body;
+    devis._id = devis._id || Date.now();
+    // Supprimer les anciennes photos pour économiser l'espace
+    const devisSave = { ...devis };
+    // Garder seulement miniature photo
+    if (devisSave._photo && devisSave._photo.length > 50000) {
+      devisSave._photoThumb = devisSave._photo.substring(0, 100) + '...';
+      delete devisSave._photo;
+    }
+    const idx = db.devis.findIndex(d => d._id === devis._id);
+    if (idx >= 0) db.devis[idx] = devisSave;
+    else db.devis.unshift(devisSave);
+    if (db.devis.length > 50) db.devis = db.devis.slice(0, 50);
+    saveDB(db);
+    console.log('Devis saved:', devis._id, '- Total:', db.devis.length);
+    res.json({ ok: true, id: devis._id });
+  } catch(e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ── RÉCUPÉRATION DEVIS ──
+app.get('/api/devis', (req, res) => {
+  try {
+    const db = loadDB();
+    res.json(db.devis);
+  } catch(e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ── SUPPRESSION DEVIS ──
+app.delete('/api/devis/:id', (req, res) => {
+  try {
+    const db = loadDB();
+    db.devis = db.devis.filter(d => String(d._id) !== String(req.params.id));
+    saveDB(db);
+    res.json({ ok: true });
+  } catch(e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.get('/', (req, res) => res.send('DevisTP Proxy OK'));
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`Proxy running on port ${PORT}`));
