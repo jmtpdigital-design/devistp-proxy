@@ -11,48 +11,39 @@ const DB_FILE = '/tmp/devis_db.json';
 const JOBS_FILE = '/tmp/jobs.json';
 
 function loadDB() {
-  try { if (fs.existsSync(DB_FILE)) return JSON.parse(fs.readFileSync(DB_FILE, 'utf8')); } catch(e) {}
+  try { if (fs.existsSync(DB_FILE)) return JSON.parse(fs.readFileSync(DB_FILE,'utf8')); } catch(e) {}
   return { devis: [] };
 }
-function saveDB(db) {
-  try { fs.writeFileSync(DB_FILE, JSON.stringify(db)); } catch(e) {}
-}
+function saveDB(db) { try { fs.writeFileSync(DB_FILE, JSON.stringify(db)); } catch(e) {} }
 function loadJobs() {
-  try { if (fs.existsSync(JOBS_FILE)) return JSON.parse(fs.readFileSync(JOBS_FILE, 'utf8')); } catch(e) {}
+  try { if (fs.existsSync(JOBS_FILE)) return JSON.parse(fs.readFileSync(JOBS_FILE,'utf8')); } catch(e) {}
   return {};
 }
-function saveJobs(jobs) {
-  try { fs.writeFileSync(JOBS_FILE, JSON.stringify(jobs)); } catch(e) {}
-}
+function saveJobs(j) { try { fs.writeFileSync(JOBS_FILE, JSON.stringify(j)); } catch(e) {} }
 
-// ── PROXY ANTHROPIC ──
+// ── CLAUDE ──
 app.post('/api/claude', async (req, res) => {
   try {
-    console.log('Claude request:', JSON.stringify(req.body).substring(0, 100));
     if (!process.env.ANTHROPIC_KEY) return res.status(500).json({ error: 'ANTHROPIC_KEY not set' });
-    const response = await fetch('https://api.anthropic.com/v1/messages', {
+    const r = await fetch('https://api.anthropic.com/v1/messages', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', 'x-api-key': process.env.ANTHROPIC_KEY, 'anthropic-version': '2023-06-01' },
       body: JSON.stringify(req.body)
     });
-    const text = await response.text();
-    console.log('Anthropic status:', response.status, text.substring(0, 150));
-    try { res.json(JSON.parse(text)); }
-    catch(e) { res.status(500).json({ error: 'Invalid JSON', raw: text }); }
-  } catch(e) {
-    res.status(500).json({ error: e.message });
-  }
+    const text = await r.text();
+    console.log('Claude status:', r.status, text.substring(0,100));
+    try { res.json(JSON.parse(text)); } catch(e) { res.status(500).json({ error: 'Bad JSON', raw: text }); }
+  } catch(e) { res.status(500).json({ error: e.message }); }
 });
 
-// ── SOUMETTRE JOB INPAINTING (répond immédiatement) ──
+// ── SUBMIT INPAINTING ──
 app.post('/api/inpainting/submit', async (req, res) => {
   try {
     console.log('Fal submit request');
     if (!process.env.FAL_KEY) return res.status(500).json({ error: 'FAL_KEY not set' });
 
     const { image, mask, prompt } = req.body;
-
-    const submitResp = await fetch('https://queue.fal.run/fal-ai/flux-pro/v1/fill', {
+    const r = await fetch('https://queue.fal.run/fal-ai/flux-pro/v1/fill', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', 'Authorization': 'Key ' + process.env.FAL_KEY },
       body: JSON.stringify({
@@ -65,22 +56,28 @@ app.post('/api/inpainting/submit', async (req, res) => {
       })
     });
 
-    const submitText = await submitResp.text();
-    console.log('Submit response:', submitText.substring(0, 200));
+    const text = await r.text();
+    console.log('Submit response:', text.substring(0, 300));
 
-    let submitData;
-    try { submitData = JSON.parse(submitText); }
-    catch(e) { return res.status(500).json({ error: 'Invalid submit response', raw: submitText }); }
+    let data;
+    try { data = JSON.parse(text); } catch(e) { return res.status(500).json({ error: 'Bad submit JSON', raw: text }); }
 
-    if (!submitData.request_id) return res.status(500).json({ error: 'No request_id', raw: submitData });
+    if (!data.request_id) return res.status(500).json({ error: 'No request_id', raw: data });
 
-    // Sauvegarder le job
+    // Sauvegarder les URLs exactes
     const jobs = loadJobs();
-    jobs[submitData.request_id] = { status: 'pending', created: Date.now() };
+    jobs[data.request_id] = {
+      status_url: data.status_url,
+      response_url: data.response_url,
+      created: Date.now()
+    };
     saveJobs(jobs);
 
-    console.log('Job submitted:', submitData.request_id);
-    res.json({ request_id: submitData.request_id, status: 'pending' });
+    console.log('Job ID:', data.request_id);
+    console.log('Status URL:', data.status_url);
+    console.log('Response URL:', data.response_url);
+
+    res.json({ request_id: data.request_id });
 
   } catch(e) {
     console.error('Submit error:', e.message);
@@ -88,82 +85,82 @@ app.post('/api/inpainting/submit', async (req, res) => {
   }
 });
 
-// ── VÉRIFIER STATUT JOB (polling léger) ──
+// ── POLL STATUS ──
 app.get('/api/inpainting/status/:id', async (req, res) => {
   try {
-    const requestId = req.params.id;
+    const id = req.params.id;
     if (!process.env.FAL_KEY) return res.status(500).json({ error: 'FAL_KEY not set' });
 
-    const pollResp = await fetch(
-      `https://queue.fal.run/fal-ai/flux-pro/v1/fill/requests/${requestId}`,
-      { headers: { 'Authorization': 'Key ' + process.env.FAL_KEY } }
-    );
+    // Utiliser le status_url exact sauvegardé lors du submit
+    const jobs = loadJobs();
+    const job = jobs[id] || {};
+    const statusUrl = job.status_url || ('https://queue.fal.run/fal-ai/flux-pro/v1/fill/requests/' + id);
 
-    const pollText = await pollResp.text();
-    console.log('Poll status:', pollResp.status, pollText.substring(0, 200));
+    console.log('Polling:', statusUrl);
+    const r = await fetch(statusUrl, { headers: { 'Authorization': 'Key ' + process.env.FAL_KEY } });
+    const text = await r.text();
+    console.log('Poll status:', r.status, text.substring(0, 150));
 
-    if (!pollText || pollText.trim() === '') {
-      return res.json({ status: 'pending' });
-    }
+    if (!text || text.trim() === '') return res.json({ status: 'pending' });
 
-    let pollData;
-    try { pollData = JSON.parse(pollText); }
-    catch(e) { return res.json({ status: 'pending' }); }
+    let data;
+    try { data = JSON.parse(text); } catch(e) { return res.json({ status: 'pending' }); }
 
-    if (pollData.status === 'COMPLETED') {
+    if (data.status === 'COMPLETED') {
+      // Récupérer le résultat final via response_url
+      const responseUrl = job.response_url || (statusUrl.replace('/status', '') + '/response');
+      console.log('Fetching result from:', responseUrl);
+
+      const rr = await fetch(responseUrl, { headers: { 'Authorization': 'Key ' + process.env.FAL_KEY } });
+      const resultText = await rr.text();
+      console.log('Result:', resultText.substring(0, 300));
+
+      let result;
+      try { result = JSON.parse(resultText); } catch(e) { result = data; }
+
       const imageUrl =
-        pollData.output?.images?.[0]?.url ||
-        pollData.output?.image?.url ||
-        pollData.output?.image ||
-        pollData.images?.[0]?.url;
+        result.images?.[0]?.url ||
+        result.output?.images?.[0]?.url ||
+        result.output?.image?.url ||
+        result.output?.image ||
+        result.image?.url ||
+        result.image;
 
-      if (!imageUrl) {
-        console.error('No image URL:', JSON.stringify(pollData));
-        return res.json({ status: 'error', error: 'No image in response' });
-      }
+      console.log('Image URL:', imageUrl);
+      if (!imageUrl) return res.json({ status: 'error', error: 'No image URL', raw: result });
 
-      // Télécharger et retourner l'image
-      const imgResp = await fetch(imageUrl);
-      const buffer = await imgResp.buffer();
-      return res.json({
-        status: 'completed',
-        image: 'data:image/jpeg;base64,' + buffer.toString('base64')
-      });
+      const img = await fetch(imageUrl);
+      const buf = await img.buffer();
+      return res.json({ status: 'completed', image: 'data:image/jpeg;base64,' + buf.toString('base64') });
     }
 
-    if (pollData.status === 'FAILED') {
-      return res.json({ status: 'error', error: 'Job failed' });
-    }
+    if (data.status === 'FAILED') return res.json({ status: 'error', error: 'Job failed' });
 
-    // IN_QUEUE ou IN_PROGRESS
-    return res.json({ status: 'pending', queue_position: pollData.queue_position });
+    return res.json({ status: 'pending', queue_position: data.queue_position });
 
   } catch(e) {
-    console.error('Status error:', e.message);
+    console.error('Poll error:', e.message);
     res.json({ status: 'pending' });
   }
 });
 
-// ── SAUVEGARDE DEVIS ──
+// ── DEVIS CRUD ──
 app.post('/api/devis/save', (req, res) => {
   try {
     const db = loadDB();
-    const devis = { ...req.body };
-    devis._id = devis._id || Date.now();
-    if (devis._photo && devis._photo.length > 50000) delete devis._photo;
-    if (devis._rendu) delete devis._rendu;
-    const idx = db.devis.findIndex(d => d._id === devis._id);
-    if (idx >= 0) db.devis[idx] = devis;
-    else db.devis.unshift(devis);
-    if (db.devis.length > 50) db.devis = db.devis.slice(0, 50);
+    const d = { ...req.body, _id: req.body._id || Date.now() };
+    if (d._photo && d._photo.length > 50000) delete d._photo;
+    if (d._rendu) delete d._rendu;
+    const i = db.devis.findIndex(x => x._id === d._id);
+    if (i >= 0) db.devis[i] = d; else db.devis.unshift(d);
+    if (db.devis.length > 50) db.devis = db.devis.slice(0,50);
     saveDB(db);
-    res.json({ ok: true, id: devis._id });
+    res.json({ ok: true });
   } catch(e) { res.status(500).json({ error: e.message }); }
 });
 
 app.get('/api/devis', (req, res) => {
-  try { res.json(loadDB().devis); }
-  catch(e) { res.status(500).json({ error: e.message }); }
+  try { res.json(loadDB().devis); } catch(e) { res.status(500).json({ error: e.message }); }
 });
 
 app.delete('/api/devis/:id', (req, res) => {
@@ -176,6 +173,5 @@ app.delete('/api/devis/:id', (req, res) => {
 });
 
 app.get('/', (req, res) => res.send('DevisTP Proxy OK'));
-
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`Proxy running on port ${PORT}`));
+app.listen(PORT, () => console.log('Proxy running on port', PORT));
