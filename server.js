@@ -28,7 +28,18 @@ app.post('/api/claude', async (req, res) => {
     const r = await fetch('https://api.anthropic.com/v1/messages', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', 'x-api-key': process.env.ANTHROPIC_KEY, 'anthropic-version': '2023-06-01' },
-      body: JSON.stringify(req.body)
+      body: (function() {
+        var body = req.body;
+        // Activer web_search pour les requetes de devis (max_tokens > 500)
+        if (body.max_tokens > 500 && !body.tools) {
+          body.tools = [{
+            type: 'web_search_20250305',
+            name: 'web_search',
+            max_uses: 3
+          }];
+        }
+        return JSON.stringify(body);
+      })()
     });
     const text = await r.text();
     console.log('Claude status:', r.status, text.substring(0,100));
