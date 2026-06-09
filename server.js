@@ -51,7 +51,7 @@ app.post('/api/inpainting/submit', async (req, res) => {
         mask_url: mask,
         prompt: prompt || 'compacted gravel driveway 0/20, flat clean professional surface, realistic photo',
         num_inference_steps: 28,
-        guidance_scale: 60,
+        guidance_scale: 10,
         output_format: 'jpeg'
       })
     });
